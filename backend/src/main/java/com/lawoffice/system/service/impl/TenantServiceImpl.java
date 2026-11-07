@@ -1,0 +1,528 @@
+package com.lawoffice.system.service.impl;
+
+import cn.hutool.core.bean.BeanUtil;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.lawoffice.framework.config.TenantContextHolder;
+import com.lawoffice.framework.dto.BaseDTO;
+import com.lawoffice.framework.dto.RequestContext;
+import com.lawoffice.framework.result.BaseResult;
+import com.lawoffice.framework.service.impl.BaseServiceImpl;
+import com.lawoffice.system.entity.Permission;
+import com.lawoffice.system.entity.Role;
+import com.lawoffice.system.entity.RolePermission;
+import com.lawoffice.system.entity.Tenant;
+import com.lawoffice.system.entity.User;
+import com.lawoffice.system.mapper.PermissionMapper;
+import com.lawoffice.system.mapper.RolePermissionMapper;
+import com.lawoffice.system.mapper.TenantMapper;
+import com.lawoffice.system.mapper.UserMapper;
+import com.lawoffice.system.service.ITenantLifecycleService;
+import com.lawoffice.system.service.ITenantService;
+import com.lawoffice.system.service.IUserService;
+import com.lawoffice.system.vo.TenantVO;
+import com.lawoffice.util.EntityFillUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.interceptor.TransactionAspectSupport;
+import org.springframework.util.StringUtils;
+
+import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Service
+public class TenantServiceImpl extends BaseServiceImpl<TenantMapper, Tenant, TenantVO> implements ITenantService {
+
+    private static final Set<String> NON_GRANTABLE_PERMISSION_CODES = Set.of(
+            "tenant:view",
+            "tenant:edit",
+            "permission:view",
+            "permission:edit",
+            "log:edit"
+    );
+    private static final Set<String> NON_GRANTABLE_MENU_URLS = Set.of(
+            "/system/tenant",
+            "/system/menu"
+    );
+
+    @Autowired
+    private UserMapper userMapper;
+
+    @Autowired
+    private PermissionMapper permissionMapper;
+
+    @Autowired
+    private RolePermissionMapper rolePermissionMapper;
+
+    @Autowired
+    private IUserService userService;
+
+    @Autowired
+    private ITenantLifecycleService tenantLifecycleService;
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public BaseResult<TenantVO> save(BaseDTO<Tenant> saveDTO) {
+        try {
+            doBeforeSave(saveDTO);
+
+            Tenant requestData = saveDTO.getEntity();
+            RequestContext context = saveDTO.getContext();
+            Tenant entity = BeanUtil.copyProperties(requestData, Tenant.class);
+
+            boolean isCreate = baseMapper.selectById(entity.getId()) == null;
+            EntityFillUtils.fillAuditFields(entity, context, isCreate);
+            this.saveOrUpdate(entity);
+
+            tenantLifecycleService.initializeTenant(
+                    entity,
+                    resolveAdminUserIds(saveDTO),
+                    resolveOperator(saveDTO),
+                    resolveOperateTime(entity));
+
+            return BaseResult.success(BeanUtil.toBean(entity, TenantVO.class));
+        } catch (IllegalArgumentException e) {
+            markRollbackOnly();
+            log.warn("保存参数校验失败: {}", e.getMessage());
+            return BaseResult.error(400, e.getMessage());
+        } catch (Exception e) {
+            markRollbackOnly();
+            log.error("保存失败", e);
+            return BaseResult.error("保存失败: " + e.getMessage());
+        }
+    }
+
+    @Override
+    protected void doBeforeSave(BaseDTO<Tenant> saveDTO) {
+        Tenant tenant = saveDTO.getEntity();
+        if (tenant == null) {
+            return;
+        }
+
+        tenant.setId(trimToNull(tenant.getId()));
+        tenant.setOriginalId(trimToNull(tenant.getOriginalId()));
+        if (!StringUtils.hasText(tenant.getId())) {
+            throw new IllegalArgumentException("租户编码不能为空");
+        }
+
+        if (StringUtils.hasText(tenant.getOriginalId()) && !tenant.getOriginalId().equals(tenant.getId())) {
+            throw new IllegalArgumentException("租户编码新增后不能修改");
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public BaseResult<Void> delete(BaseDTO<Tenant> deleteDTO) {
+        try {
+            doBeforeDelete(deleteDTO);
+
+            String id = deleteDTO.getId();
+            if (!StringUtils.hasText(id)) {
+                return BaseResult.error("ID不能为空");
+            }
+
+            getExistingTenant(id);
+            String deleteBy = resolveDeleteBy(deleteDTO);
+            tenantLifecycleService.deleteTenantRelations(id, deleteBy);
+            softDeleteTenant(id, deleteBy);
+            return BaseResult.success();
+        } catch (Exception e) {
+            markRollbackOnly();
+            log.error("删除失败", e);
+            return BaseResult.error("删除失败: " + e.getMessage());
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public BaseResult<Void> batchDelete(BaseDTO<Tenant> deleteDTO) {
+        try {
+            doBeforeDelete(deleteDTO);
+
+            List<String> tenantIds = getDeleteTenantIds(deleteDTO);
+            if (tenantIds.isEmpty()) {
+                return BaseResult.error("删除ID列表不能为空");
+            }
+
+            String deleteBy = resolveDeleteBy(deleteDTO);
+            for (String tenantId : tenantIds) {
+                getExistingTenant(tenantId);
+            }
+            for (String tenantId : tenantIds) {
+                tenantLifecycleService.deleteTenantRelations(tenantId, deleteBy);
+                softDeleteTenant(tenantId, deleteBy);
+            }
+            return BaseResult.success();
+        } catch (Exception e) {
+            markRollbackOnly();
+            log.error("批量删除失败", e);
+            return BaseResult.error("批量删除失败: " + e.getMessage());
+        }
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void assignTenantUsers(String tenantId, List<String> userIds) {
+        validateTenantId(tenantId);
+
+        List<String> normalizedUserIds = normalizeIds(userIds);
+        validateUsers(normalizedUserIds);
+        tenantLifecycleService.assignTenantUsers(tenantId, normalizedUserIds, "system");
+
+        log.info("为租户分配用户成功，租户ID: {}, 用户数量: {}", tenantId, normalizedUserIds.size());
+    }
+
+    @Override
+    public List<String> getTenantUserIds(String tenantId) {
+        return tenantLifecycleService.getTenantUserIds(tenantId);
+    }
+
+    @Override
+    public List<String> getTenantAdminUserIds(String tenantId) {
+        return tenantLifecycleService.getTenantAdminUserIds(tenantId);
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void assignTenantAdmins(String tenantId, List<String> userIds) {
+        validateTenantId(tenantId);
+
+        List<String> normalizedUserIds = normalizeIds(userIds);
+        validateUsers(normalizedUserIds);
+        tenantLifecycleService.assignTenantAdmins(tenantId, normalizedUserIds, "system");
+
+        log.info("为租户分配管理员成功，租户ID: {}, 用户数量: {}", tenantId, normalizedUserIds.size());
+    }
+
+    @Override
+    public List<String> getTenantAdminPermissionIds(String tenantId) {
+        validateTenantId(tenantId);
+
+        Role adminRole = tenantLifecycleService.ensureTenantAdminRole(tenantId, "system", LocalDateTime.now());
+        return runWithTenant(tenantId, () -> {
+            LambdaQueryWrapper<RolePermission> wrapper = new LambdaQueryWrapper<>();
+            wrapper.eq(RolePermission::getRoleId, adminRole.getId())
+                    .eq(RolePermission::getDeleteFlag, 0);
+            return rolePermissionMapper.selectList(wrapper).stream()
+                    .map(RolePermission::getPermissionId)
+                    .filter(StringUtils::hasText)
+                    .distinct()
+                    .collect(Collectors.toList());
+        });
+    }
+
+    @Override
+    @Transactional(rollbackFor = Exception.class)
+    public void assignTenantAdminPermissions(String tenantId, List<String> permissionIds, String operatorUsername) {
+        validateTenantId(tenantId);
+
+        Role adminRole = tenantLifecycleService.ensureTenantAdminRole(tenantId, resolveOperator(operatorUsername), LocalDateTime.now());
+        List<String> normalizedPermissionIds = expandPermissionIdsWithAncestors(normalizeIds(permissionIds));
+        validatePermissions(normalizedPermissionIds);
+        // 租户管理员角色授权由租户管理入口完成，但授权范围仍必须受当前操作人自身权限约束。
+        validateGrantWithinOperatorPermissions(normalizedPermissionIds, operatorUsername);
+        syncTenantAdminRolePermissions(tenantId, adminRole.getId(), normalizedPermissionIds, resolveOperator(operatorUsername));
+
+        log.info("Tenant admin permissions assigned, tenantId: {}, permissionCount: {}", tenantId, normalizedPermissionIds.size());
+    }
+
+    /**
+     * 判断权限编码是否允许下放给租户默认管理员角色。
+     */
+    private boolean isGrantableToTenantAdmin(String perms) {
+        return !NON_GRANTABLE_PERMISSION_CODES.contains(perms);
+    }
+
+    private boolean isGrantableToTenantAdmin(Permission permission) {
+        if (permission == null) {
+            return false;
+        }
+        if (StringUtils.hasText(permission.getUrl()) && NON_GRANTABLE_MENU_URLS.contains(permission.getUrl().trim())) {
+            return false;
+        }
+        return !StringUtils.hasText(permission.getPerms()) || isGrantableToTenantAdmin(permission.getPerms());
+    }
+
+    /**
+     * 校验租户管理员授权不能超过当前操作人可下放的权限范围。
+     */
+    private void validateGrantWithinOperatorPermissions(List<String> permissionIds, String operatorUsername) {
+        if (permissionIds.isEmpty() || !StringUtils.hasText(operatorUsername)) {
+            return;
+        }
+
+        User operator = userService.getCurrentUserInfo(operatorUsername);
+        Set<String> operatorPermissionIds = userService.getUserPermissionsInCurrentTenant(operator.getId()).stream()
+                .filter(this::isGrantableToTenantAdmin)
+                .map(Permission::getId)
+                .collect(Collectors.toSet());
+
+        LambdaQueryWrapper<Permission> wrapper = new LambdaQueryWrapper<>();
+        wrapper.in(Permission::getId, permissionIds)
+                .eq(Permission::getDeleteFlag, 0);
+        List<String> overLimitPermissions = permissionMapper.selectList(wrapper).stream()
+                .filter(permission -> !isGrantableToTenantAdmin(permission) || !operatorPermissionIds.contains(permission.getId()))
+                .map(permission -> StringUtils.hasText(permission.getPerms()) ? permission.getPerms() : permission.getName())
+                .filter(StringUtils::hasText)
+                .distinct()
+                .collect(Collectors.toList());
+        if (!overLimitPermissions.isEmpty()) {
+            throw new IllegalArgumentException("Cannot grant permissions beyond current user scope: " + String.join(",", overLimitPermissions));
+        }
+    }
+
+    /**
+     * 在目标租户上下文中覆盖同步默认管理员角色权限。
+     */
+    private void syncTenantAdminRolePermissions(String tenantId, String roleId, List<String> permissionIds, String deleteBy) {
+        runWithTenant(tenantId, () -> {
+            LambdaQueryWrapper<RolePermission> deleteWrapper = new LambdaQueryWrapper<>();
+            deleteWrapper.eq(RolePermission::getRoleId, roleId)
+                    .eq(RolePermission::getDeleteFlag, 0);
+            softDeleteRolePermissions(deleteWrapper, deleteBy);
+
+            for (String permissionId : permissionIds) {
+                RolePermission rolePermission = new RolePermission();
+                rolePermission.setRoleId(roleId);
+                rolePermission.setPermissionId(permissionId);
+                rolePermissionMapper.insert(rolePermission);
+            }
+            return null;
+        });
+    }
+
+    /**
+     * 补齐被授权权限的父级权限，保证菜单树可正常展示。
+     */
+    private List<String> expandPermissionIdsWithAncestors(List<String> permissionIds) {
+        Set<String> expandedIds = new LinkedHashSet<>(permissionIds);
+        for (String permissionId : permissionIds) {
+            Permission permission = permissionMapper.selectById(permissionId);
+            if (permission == null || (permission.getDeleteFlag() != null && permission.getDeleteFlag() == 1)) {
+                throw new IllegalArgumentException("Permission does not exist or has been deleted");
+            }
+
+            String parentId = permission.getParentId();
+            Set<String> visitedParentIds = new LinkedHashSet<>();
+            while (StringUtils.hasText(parentId)) {
+                if (!visitedParentIds.add(parentId)) {
+                    throw new IllegalArgumentException("Permission parent relationship has a cycle");
+                }
+                Permission parent = permissionMapper.selectById(parentId);
+                if (parent == null || (parent.getDeleteFlag() != null && parent.getDeleteFlag() == 1)) {
+                    throw new IllegalArgumentException("Parent permission does not exist or has been deleted");
+                }
+                expandedIds.add(parent.getId());
+                parentId = parent.getParentId();
+            }
+        }
+        return new ArrayList<>(expandedIds);
+    }
+
+    /**
+     * 校验权限 ID 列表对应的权限存在且未删除。
+     */
+    private void validatePermissions(List<String> permissionIds) {
+        if (permissionIds.isEmpty()) {
+            return;
+        }
+
+        LambdaQueryWrapper<Permission> wrapper = new LambdaQueryWrapper<>();
+        wrapper.in(Permission::getId, permissionIds)
+                .eq(Permission::getDeleteFlag, 0)
+                .eq(Permission::getStatus, "1");
+        long count = permissionMapper.selectCount(wrapper);
+        if (count != permissionIds.size()) {
+            throw new IllegalArgumentException("Permission does not exist, has been deleted, or is disabled");
+        }
+    }
+
+    /**
+     * 按条件逻辑删除角色-权限关系。
+     */
+    private void softDeleteRolePermissions(LambdaQueryWrapper<RolePermission> wrapper, String deleteBy) {
+        RolePermission rolePermission = new RolePermission();
+        EntityFillUtils.fillDeleteFields(rolePermission, deleteBy);
+        rolePermissionMapper.update(rolePermission, wrapper);
+    }
+
+    /**
+     * 逻辑删除租户主记录。
+     */
+    private void softDeleteTenant(String tenantId, String deleteBy) {
+        Tenant tenant = new Tenant();
+        tenant.setId(tenantId);
+        EntityFillUtils.fillDeleteFields(tenant, deleteBy);
+        baseMapper.updateById(tenant);
+    }
+
+    /**
+     * 校验租户 ID 不为空。
+     */
+    private void validateTenantId(String tenantId) {
+        getExistingTenant(tenantId);
+    }
+
+    /**
+     * 查询未删除租户，不存在时抛出业务异常。
+     */
+    private Tenant getExistingTenant(String tenantId) {
+        if (!StringUtils.hasText(tenantId)) {
+            throw new IllegalArgumentException("租户ID不能为空");
+        }
+
+        Tenant tenant = baseMapper.selectById(tenantId);
+        if (tenant == null || (tenant.getDeleteFlag() != null && tenant.getDeleteFlag() == 1)) {
+            throw new IllegalArgumentException("租户不存在或已删除");
+        }
+        return tenant;
+    }
+
+    /**
+     * 校验用户 ID 列表对应的用户存在且未删除。
+     */
+    private void validateUsers(List<String> userIds) {
+        if (userIds.isEmpty()) {
+            return;
+        }
+
+        LambdaQueryWrapper<User> wrapper = new LambdaQueryWrapper<>();
+        wrapper.in(User::getId, userIds)
+                .eq(User::getDeleteFlag, 0)
+                .eq(User::getStatus, 1);
+        long count = userMapper.selectCount(wrapper);
+        if (count != userIds.size()) {
+            throw new IllegalArgumentException("包含不存在、已删除或已冻结的用户");
+        }
+    }
+
+    /**
+     * 将字符串 trim 后的空值统一转为 null。
+     */
+    private String trimToNull(String value) {
+        if (!StringUtils.hasText(value)) {
+            return null;
+        }
+        return value.trim();
+    }
+
+    /**
+     * 清洗 ID 列表，去空、去重并保持传入顺序。
+     */
+    private List<String> normalizeIds(List<String> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return new ArrayList<>();
+        }
+        return ids.stream()
+                .filter(StringUtils::hasText)
+                .map(String::trim)
+                .distinct()
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * 从删除请求中解析单个或批量删除租户 ID。
+     */
+    private List<String> getDeleteTenantIds(BaseDTO<Tenant> deleteDTO) {
+        List<String> ids = new ArrayList<>();
+        if (deleteDTO == null) {
+            return ids;
+        }
+        if (StringUtils.hasText(deleteDTO.getId())) {
+            ids.add(deleteDTO.getId());
+        }
+        if (deleteDTO.getDeleteIds() != null) {
+            ids.addAll(deleteDTO.getDeleteIds());
+        }
+        return normalizeIds(ids);
+    }
+
+    /**
+     * 从请求上下文解析删除人账号。
+     */
+    private String resolveDeleteBy(BaseDTO<Tenant> deleteDTO) {
+        if (deleteDTO != null && deleteDTO.getContext() != null
+                && StringUtils.hasText(deleteDTO.getContext().getUsername())) {
+            return deleteDTO.getContext().getUsername();
+        }
+        return "system";
+    }
+
+    /**
+     * 从保存请求上下文解析操作人账号。
+     */
+    private String resolveOperator(BaseDTO<Tenant> saveDTO) {
+        if (saveDTO != null && saveDTO.getContext() != null && StringUtils.hasText(saveDTO.getContext().getUsername())) {
+            return saveDTO.getContext().getUsername();
+        }
+        return "system";
+    }
+
+    /**
+     * 解析操作人账号，缺省时使用 system 作为兜底。
+     */
+    private String resolveOperator(String operatorUsername) {
+        if (StringUtils.hasText(operatorUsername)) {
+            return operatorUsername;
+        }
+        return "system";
+    }
+
+    /**
+     * 从租户保存请求中解析初始管理员用户 ID。
+     */
+    private List<String> resolveAdminUserIds(BaseDTO<Tenant> saveDTO) {
+        if (saveDTO == null || saveDTO.getEntity() == null) {
+            return new ArrayList<>();
+        }
+        return normalizeIds(saveDTO.getEntity().getAdminUserIds());
+    }
+
+    /**
+     * 解析租户初始化操作时间，优先使用租户创建时间。
+     */
+    private LocalDateTime resolveOperateTime(Tenant entity) {
+        if (entity.getUpdateTime() != null) {
+            return entity.getUpdateTime();
+        }
+        if (entity.getCreateTime() != null) {
+            return entity.getCreateTime();
+        }
+        return LocalDateTime.now();
+    }
+
+    /**
+     * 在已捕获异常并返回失败响应前，显式标记当前事务回滚。
+     */
+    private void markRollbackOnly() {
+        try {
+            TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+        } catch (Exception ignored) {
+            // No transaction is active only in unusual proxy bypass scenarios.
+        }
+    }
+
+    /**
+     * 临时切换租户上下文执行查询或写入，并在结束后恢复原上下文。
+     */
+    private <T> T runWithTenant(String tenantId, Supplier<T> supplier) {
+        String previousTenantId = TenantContextHolder.getCurrentTenantId();
+        try {
+            TenantContextHolder.setCurrentTenantId(tenantId);
+            return supplier.get();
+        } finally {
+            if (StringUtils.hasText(previousTenantId)) {
+                TenantContextHolder.setCurrentTenantId(previousTenantId);
+            } else {
+                TenantContextHolder.clear();
+            }
+        }
+    }
+}

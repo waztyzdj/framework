@@ -1,0 +1,343 @@
+package com.lawoffice.workflow.service;
+
+import com.lawoffice.framework.dto.RequestContext;
+import com.lawoffice.framework.result.BaseResult;
+import com.lawoffice.framework.vo.PageVO;
+import com.lawoffice.system.vo.FileUploadVO;
+import com.lawoffice.workflow.dto.WorkflowDownloadFile;
+import com.lawoffice.workflow.req.AvailableProcessPageReq;
+import com.lawoffice.workflow.req.AssigneePreviewReq;
+import com.lawoffice.workflow.req.AttachmentBindReq;
+import com.lawoffice.workflow.req.CcPageReq;
+import com.lawoffice.workflow.req.StartedInstancePageReq;
+import com.lawoffice.workflow.req.StartProcessReq;
+import com.lawoffice.workflow.req.TaskActionReq;
+import com.lawoffice.workflow.req.TaskPageReq;
+import com.lawoffice.workflow.vo.AttachmentVO;
+import com.lawoffice.workflow.vo.AssigneeSelectNodeVO;
+import com.lawoffice.workflow.vo.AvailableProcessVO;
+import com.lawoffice.workflow.vo.CcRecordVO;
+import com.lawoffice.workflow.vo.InstanceDiagramVO;
+import com.lawoffice.workflow.vo.InstanceDetailVO;
+import com.lawoffice.workflow.vo.OperationRecordVO;
+import com.lawoffice.workflow.vo.ReminderRecordVO;
+import com.lawoffice.workflow.vo.RuntimeTaskVO;
+import com.lawoffice.workflow.vo.StartFormVO;
+import com.lawoffice.workflow.vo.StartProcessVO;
+import com.lawoffice.workflow.vo.StartedInstanceVO;
+import com.lawoffice.workflow.vo.TaskActionVO;
+import com.lawoffice.workflow.vo.TaskFormVO;
+
+import java.io.InputStream;
+import java.util.List;
+
+/**
+ * 审批运行时服务。
+ */
+public interface IRuntimeService {
+
+    /**
+     * 查询当前用户有权限发起的已发布流程。
+     *
+     * @param req 分页筛选请求
+     * @param context 当前请求上下文
+     * @return 可发起流程分页
+     */
+    BaseResult<PageVO<AvailableProcessVO>> pageAvailableProcesses(AvailableProcessPageReq req, RequestContext context);
+
+    /**
+     * 获取当前用户可发起的流程表单快照。
+     *
+     * @param processModelId 流程模型ID
+     * @param context 当前请求上下文
+     * @return 发起表单信息
+     */
+    BaseResult<StartFormVO> getStartForm(String processModelId, RequestContext context);
+
+    /**
+     * 发起审批申请，写入业务实例并启动 Flowable 流程。
+     *
+     * @param req 发起申请请求
+     * @param context 当前请求上下文
+     * @return 发起结果
+     */
+    BaseResult<StartProcessVO> start(StartProcessReq req, RequestContext context);
+
+    /**
+     * 保存发起申请草稿，并生成发起人的待提交任务。
+     *
+     * @param req 发起申请草稿请求
+     * @param context 当前请求上下文
+     * @return 草稿实例结果
+     */
+    BaseResult<StartProcessVO> saveStartDraft(StartProcessReq req, RequestContext context);
+
+    /**
+     * 提交发起申请草稿，启动 Flowable 流程。
+     *
+     * @param taskId 草稿待提交任务ID
+     * @param req 提交请求
+     * @param context 当前请求上下文
+     * @return 提交结果
+     */
+    BaseResult<TaskActionVO> submitStartDraft(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 保存待提交的发起申请草稿，不启动 Flowable 流程。
+     *
+     * @param taskId 草稿待提交任务ID
+     * @param req 保存请求
+     * @param context 当前请求上下文
+     * @return 保存结果
+     */
+    BaseResult<TaskActionVO> saveStartDraftTask(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 查询当前用户发起的审批实例。
+     *
+     * @param req 分页筛选请求
+     * @param context 当前请求上下文
+     * @return 我发起的实例分页
+     */
+    BaseResult<PageVO<StartedInstanceVO>> pageStartedInstances(StartedInstancePageReq req, RequestContext context);
+
+    /**
+     * 查询当前用户待办任务。
+     *
+     * @param req 分页筛选请求
+     * @param context 当前请求上下文
+     * @return 待办任务分页
+     */
+    BaseResult<PageVO<RuntimeTaskVO>> pageTodo(TaskPageReq req, RequestContext context);
+
+    /**
+     * 查询当前用户已办任务。
+     *
+     * @param req 分页筛选请求
+     * @param context 当前请求上下文
+     * @return 已办任务分页
+     */
+    BaseResult<PageVO<RuntimeTaskVO>> pageDone(TaskPageReq req, RequestContext context);
+
+    /**
+     * 统计当前用户待办任务数。
+     *
+     * @param context 当前请求上下文
+     * @return 待办任务数
+     */
+    long countTodoTasks(RequestContext context);
+
+    /**
+     * 统计当前用户已办流程实例数。
+     *
+     * @param context 当前请求上下文
+     * @return 已办流程实例数
+     */
+    long countDoneTasks(RequestContext context);
+
+    /**
+     * 统计当前用户收到的抄送数。
+     *
+     * @param status 抄送状态，空值表示全部
+     * @param context 当前请求上下文
+     * @return 抄送数量
+     */
+    long countCcRecords(String status, RequestContext context);
+
+    /**
+     * 查询任务办理表单和当前节点字段权限。
+     *
+     * @param taskId 本地任务ID
+     * @param context 当前请求上下文
+     * @return 任务表单
+     */
+    BaseResult<TaskFormVO> getTaskForm(String taskId, RequestContext context);
+
+    /**
+     * 按当前表单数据预判下一审批节点需要选择的审批人。
+     *
+     * @param req 预判请求
+     * @param context 当前请求上下文
+     * @return 审批人选择节点
+     */
+    BaseResult<List<AssigneeSelectNodeVO>> previewNextAssigneeSelectNodes(AssigneePreviewReq req, RequestContext context);
+
+    /**
+     * 审批通过当前任务。
+     *
+     * @param taskId 本地任务ID
+     * @param req 审批动作请求
+     * @param context 当前请求上下文
+     * @return 处理结果
+     */
+    BaseResult<TaskActionVO> approve(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 将当前流程实例处理为不通过。
+     *
+     * @param taskId 本地任务ID
+     * @param req 审批动作请求
+     * @param context 当前请求上下文
+     * @return 处理结果
+     */
+    BaseResult<TaskActionVO> reject(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 转办当前任务。
+     *
+     * @param taskId 本地任务ID
+     * @param req 转办请求
+     * @param context 当前请求上下文
+     * @return 处理结果
+     */
+    BaseResult<TaskActionVO> transfer(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 退回当前任务到目标节点。
+     *
+     * @param taskId 本地任务ID
+     * @param req 退回请求
+     * @param context 当前请求上下文
+     * @return 处理结果
+     */
+    BaseResult<TaskActionVO> returnTask(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 加签当前任务。
+     *
+     * @param taskId 本地任务ID
+     * @param req 加签请求
+     * @param context 当前请求上下文
+     * @return 处理结果
+     */
+    BaseResult<TaskActionVO> addSign(String taskId, TaskActionReq req, RequestContext context);
+
+    /**
+     * 发起人撤回自己发起且尚未被审批人办理的流程实例。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param context 当前请求上下文
+     * @return 撤回结果
+     */
+    BaseResult<TaskActionVO> withdraw(String processInstanceId, RequestContext context);
+
+    /**
+     * 查询审批详情聚合数据。
+     *
+     * @param id 审批实例ID
+     * @param context 当前请求上下文
+     * @return 审批详情
+     */
+    BaseResult<InstanceDetailVO> getInstanceDetail(String id, RequestContext context);
+
+    /**
+     * 查询审批记录时间线。
+     *
+     * @param id 审批实例ID
+     * @param context 当前请求上下文
+     * @return 审批记录
+     */
+    BaseResult<List<OperationRecordVO>> listInstanceRecords(String id, RequestContext context);
+
+    /**
+     * 查询当前用户收到的抄送。
+     *
+     * @param req 分页筛选请求
+     * @param context 当前请求上下文
+     * @return 抄送记录分页
+     */
+    BaseResult<PageVO<CcRecordVO>> pageCc(CcPageReq req, RequestContext context);
+
+    /**
+     * 标记当前用户收到的抄送为已读。
+     *
+     * @param ccRecordId 抄送记录ID
+     * @param context 当前请求上下文
+     * @return 抄送记录
+     */
+    BaseResult<CcRecordVO> markCcRead(String ccRecordId, RequestContext context);
+
+    /**
+     * 手动抄送审批实例给指定人员。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param receiverUserIds 接收人用户ID列表
+     * @param context 当前请求上下文
+     * @return 抄送记录列表
+     */
+    BaseResult<List<CcRecordVO>> sendCc(String processInstanceId, List<String> receiverUserIds,
+            RequestContext context);
+
+    /**
+     * 发起人催办当前有效待办，不改变流程状态或任务状态。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param remark 催办备注
+     * @param context 当前请求上下文
+     * @return 催办记录列表
+     */
+    BaseResult<List<ReminderRecordVO>> urge(String processInstanceId, String remark, RequestContext context);
+
+    /**
+     * 查询审批实例附件。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param context 当前请求上下文
+     * @return 审批附件
+     */
+    BaseResult<List<AttachmentVO>> listAttachments(String processInstanceId, RequestContext context);
+
+    /**
+     * 绑定审批附件。
+     *
+     * @param req 附件绑定请求
+     * @param context 当前请求上下文
+     * @return 审批附件记录
+     */
+    BaseResult<AttachmentVO> bindAttachment(AttachmentBindReq req, RequestContext context);
+
+    /**
+     * 删除审批附件。
+     *
+     * @param attachmentId 附件ID
+     * @param context 当前请求上下文
+     * @return 删除结果
+     */
+    BaseResult<Void> deleteAttachment(String attachmentId, RequestContext context);
+
+    /**
+     * 按审批附件ID获取可下载文件元数据。
+     *
+     * @param attachmentId 附件ID
+     * @param context 当前请求上下文
+     * @return 文件元数据
+     */
+    FileUploadVO requireAttachmentFile(String attachmentId, RequestContext context);
+
+    /**
+     * 按审批附件ID下载文件内容。
+     *
+     * @param attachmentId 附件ID
+     * @param context 当前请求上下文
+     * @return 文件内容流
+     */
+    InputStream downloadAttachmentContent(String attachmentId, RequestContext context);
+
+    /**
+     * 打包下载审批实例全部附件，不包含审批单 PDF。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param context 当前请求上下文
+     * @return ZIP 文件
+     */
+    WorkflowDownloadFile downloadAttachmentPackage(String processInstanceId, RequestContext context);
+
+    /**
+     * 查询审批实例流程图数据。
+     *
+     * @param processInstanceId 流程实例ID
+     * @param context 当前请求上下文
+     * @return 流程图数据
+     */
+    BaseResult<InstanceDiagramVO> getInstanceDiagram(String processInstanceId, RequestContext context);
+}
